@@ -169,7 +169,7 @@ extern "C" void app_main(void) {
   if (xReturn0 != pdPASS) {
     ESP_LOGE(app_main_task_TAG.data(), "Failed to create task: %s",
              led_toggle_task_TAG.data());
-    vTaskDelete(led_task_handle);
+    led_task_handle = NULL;
     vTaskDelete(NULL);
   }
 
@@ -180,7 +180,7 @@ extern "C" void app_main(void) {
   if (xReturn1 != pdPASS) {
     ESP_LOGE(app_main_task_TAG.data(), "Failed to create task: %s",
              uart_task_TAG.data());
-    vTaskDelete(uart_task_handle);
+    uart_task_handle = NULL;
     vTaskDelete(NULL);
   }
   vTaskDelete(NULL);
