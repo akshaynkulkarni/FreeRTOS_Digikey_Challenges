@@ -14,14 +14,17 @@
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
 
-
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 
 #include "esp_timer.h"
 
-#define UART_DELAY (100U / portTICK_RATE_MS)
-#define ADC_DELAY_US (10000U)
+SemaphoreHandle_t signal_buff_full_bin = NULL;
+SemaphoreHandle_t signal_buff_empty_bin = NULL;
+SemaphoreHandle_t avg_mutex = NULL;
+
+#define UART_DELAY (10U / portTICK_RATE_MS)
+#define ADC_DELAY_US (100U * 1000U) // 100ms
 
 #define TASK_STACK_SIZE (12U * 1024U) // 12kb
 
@@ -48,25 +51,49 @@ uint8_t head = 0;
 uint8_t tail = 0;
 
 void IRAM_ATTR ADC_Timer_ISR(void *params) {
+  static uint8_t buffer_count = 0;
+  if (buffer_count >= c_queue_len) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (xSemaphoreGiveFromISR(signal_buff_empty_bin,
+                              &xHigherPriorityTaskWoken) == pdTRUE) {
+      buffer_count = 0;
+    }
+    return;
+  }
 
   // Producer: insert the raw adc value into the queue
-  c_queue[head] = adc1_get_raw(ADC1_CHANNEL_5);
-  head = (head + 1) % c_queue_len;
+
+  if (buffer_count < c_queue_len) {
+    c_queue[head] = adc1_get_raw(ADC1_CHANNEL_5);
+    head = (head + 1) % c_queue_len;
+    buffer_count++;
+  }
+  if (buffer_count >= c_queue_len) {
+    // signal buffer 1 is full
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(signal_buff_full_bin, &xHigherPriorityTaskWoken);
+  }
 }
 
 void ADC_post_processing_Task(void *params) {
   uint32_t adc_sum = 0;
   while (true) {
+    if (xSemaphoreTake(signal_buff_full_bin, portMAX_DELAY)) {
+      adc_sum = 0;
+      // consumer task
+      for (uint8_t i = 0; i < c_queue_len; i++) {
+        adc_sum += c_queue[tail];
+        tail = ((tail + 1) % c_queue_len);
+      }
 
-    adc_sum = 0;
-    // consumer task
-    for (uint8_t i = 0; i < c_queue_len; i++) {
-      adc_sum += c_queue[tail];
-      tail = ((tail + 1) % c_queue_len);
+      xSemaphoreTake(signal_buff_empty_bin, portMAX_DELAY);
+
+      if (xSemaphoreTake(avg_mutex, portMAX_DELAY)) {
+        avg_adc.store((float)(((float)adc_sum / (c_queue_len))));
+        xSemaphoreGive(avg_mutex);
+      }
     }
-    avg_adc.store((float)esp_adc_cal_raw_to_voltage(
-        ((float)adc_sum / c_queue_len), &adc1_chars));
-    vTaskDelay(UART_DELAY);
+    // vTaskDelay(UART_DELAY);
   }
   vTaskDelete(NULL);
 }
@@ -150,7 +177,7 @@ void uart_task(void *params) {
     memset(read_buff, 0, strlen(read_buff)); // clear the local buffer
     do {
       ret = uart_read_bytes(uart_port_num, (void *)read_buff,
-                            (sizeof(read_buff) - 1), 10 * UART_DELAY);
+                            (sizeof(read_buff) - 1), 50 * UART_DELAY);
     } while (ret == 0);
 
     if (ret == -1) {
@@ -165,10 +192,13 @@ void uart_task(void *params) {
       uart_write_bytes(uart_port_num, (const char *)"\n\r", strlen("\n\r"));
 
       if (!strcmp("avg\r", read_buff) || !strcmp("avg\n", read_buff)) {
-        ESP_LOGI(uart_task_TAG.data(), "Average is %f", avg_adc.load());
+        if (xSemaphoreTake(avg_mutex, portMAX_DELAY)) {
+          ESP_LOGI(uart_task_TAG.data(), "Average is %f", avg_adc.load());
+          xSemaphoreGive(avg_mutex);
+        }
       }
     }
-    vTaskDelay(UART_DELAY);
+    vTaskDelay(2 * UART_DELAY);
   }
   vTaskDelete(NULL);
 }
@@ -177,6 +207,10 @@ extern "C" void app_main(void) {
 
   ESP_ERROR_CHECK(adc_init());
   ESP_ERROR_CHECK(uart_init());
+
+  signal_buff_full_bin = xSemaphoreCreateBinary();
+  signal_buff_empty_bin = xSemaphoreCreateBinary();
+  avg_mutex = xSemaphoreCreateMutex();
 
   BaseType_t xReturn0 =
       xTaskCreate(&ADC_post_processing_Task, adc_processing_task_TAG.data(),
