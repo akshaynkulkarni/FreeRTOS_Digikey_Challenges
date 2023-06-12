@@ -19,17 +19,19 @@
 
 #include "esp_timer.h"
 
-SemaphoreHandle_t signal_buff_full_bin = NULL;
-SemaphoreHandle_t signal_buff_empty_bin = NULL;
-SemaphoreHandle_t avg_mutex = NULL;
-
 #define UART_DELAY (10U / portTICK_RATE_MS)
 #define ADC_DELAY_US (100U * 1000U) // 100ms
 
 #define TASK_STACK_SIZE (12U * 1024U) // 12kb
 
+#define DBG 0
+
 TaskHandle_t adc_processing_task_handle = NULL;
 TaskHandle_t uart_task_handle = NULL;
+
+SemaphoreHandle_t signal_buff_full = NULL; // Signal a buffer is full
+SemaphoreHandle_t avg_mutex =
+    NULL; // sync between the adc processor task and uart task
 
 constexpr std::string_view adc_processing_task_TAG = "ADC_processing_task";
 constexpr std::string_view uart_task_TAG = "uart_task";
@@ -45,55 +47,91 @@ std::atomic<float> avg_adc = {0.0f};
 static esp_timer_handle_t timer = NULL;
 static esp_adc_cal_characteristics_t adc1_chars;
 
-const uint8_t c_queue_len = 10;
-volatile uint32_t c_queue[c_queue_len];
-uint8_t head = 0;
-uint8_t tail = 0;
+// static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED; // CS is
+// required if we are accessing an element of the buffer.
+static portMUX_TYPE avg_spinlock = portMUX_INITIALIZER_UNLOCKED;
+constexpr size_t buffer_len =
+    4; // The ring buffer has 'n' buffers that can be configured. Min. 2
+constexpr size_t buffer_mem_len = 10;
+
+using buf = struct {
+  uint16_t adc_val[buffer_mem_len];
+};
+
+volatile buf ring_buffer[buffer_len] = {0};
+volatile uint8_t head = 0;
+volatile uint8_t tail = 0;
 
 void IRAM_ATTR ADC_Timer_ISR(void *params) {
-  static uint8_t buffer_count = 0;
-  if (buffer_count >= c_queue_len) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    if (xSemaphoreGiveFromISR(signal_buff_empty_bin,
-                              &xHigherPriorityTaskWoken) == pdTRUE) {
-      buffer_count = 0;
-    }
+
+  if (((head + 1) % buffer_len) == tail) {
+    // drop the elements, buffer full, sorry
+    ESP_LOGE("ISR", "Sorry! Buffer Full!! dropping adc_values....");
     return;
   }
 
-  // Producer: insert the raw adc value into the queue
+  static int buffer_mem_count = 0;
 
-  if (buffer_count < c_queue_len) {
-    c_queue[head] = adc1_get_raw(ADC1_CHANNEL_5);
-    head = (head + 1) % c_queue_len;
-    buffer_count++;
+  if (buffer_mem_count < buffer_mem_len) {
+    int l_buffer_mem_count = buffer_mem_count;
+    // portENTER_CRITICAL_ISR(&spinlock);
+    ring_buffer[head].adc_val[buffer_mem_count] = adc1_get_raw(ADC1_CHANNEL_5);
+    buffer_mem_count++;
+    // portEXIT_CRITICAL_ISR(&spinlock);
+#if DBG
+    ESP_LOGI("ISR", "ring_buffer[%d].adc_val[%d] = %d", head,
+             l_buffer_mem_count, ring_buffer[head].adc_val[l_buffer_mem_count]);
+#endif
   }
-  if (buffer_count >= c_queue_len) {
-    // signal buffer 1 is full
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(signal_buff_full_bin, &xHigherPriorityTaskWoken);
+
+  if (buffer_mem_count >= buffer_mem_len) {
+
+    // portENTER_CRITICAL_ISR(&spinlock);
+    head = ((head + 1) % buffer_len); // let's fill the next buffer element
+    buffer_mem_count = 0;             // reset the member buffer count
+    // portEXIT_CRITICAL_ISR(&spinlock);
+
+    BaseType_t xTaskWoken = pdFALSE;
+    // Signal a buffer is ready to be consumed
+    xSemaphoreGiveFromISR(signal_buff_full, &xTaskWoken);
+    // We need to request context change within ISR if the woken task has higher
+    // priority over the current running task. ADC post processing task has
+    // priority 2.
+    if (xTaskWoken) {
+      portYIELD_FROM_ISR();
+    }
   }
 }
 
 void ADC_post_processing_Task(void *params) {
   uint32_t adc_sum = 0;
+  uint32_t l_tail = 0;
   while (true) {
-    if (xSemaphoreTake(signal_buff_full_bin, portMAX_DELAY)) {
+    if (xSemaphoreTake(signal_buff_full, portMAX_DELAY)) {
       adc_sum = 0;
-      // consumer task
-      for (uint8_t i = 0; i < c_queue_len; i++) {
-        adc_sum += c_queue[tail];
-        tail = ((tail + 1) % c_queue_len);
-      }
 
-      xSemaphoreTake(signal_buff_empty_bin, portMAX_DELAY);
+      // portENTER_CRITICAL(&spinlock);
+      for (uint8_t i = 0; i < buffer_mem_len; i++) {
+        adc_sum += ring_buffer[tail].adc_val[i];
 
-      if (xSemaphoreTake(avg_mutex, portMAX_DELAY)) {
-        avg_adc.store((float)(((float)adc_sum / (c_queue_len))));
-        xSemaphoreGive(avg_mutex);
+        // ESP_LOGI("adc", "ring_buffer[%d].adc_val[%d] = %d", tail, i,
+        // ring_buffer[tail].adc_val[i]);
       }
+      l_tail = tail;
+      tail = ((tail + 1) % buffer_len);
+      // portEXIT_CRITICAL(&spinlock);
+#if DBG
+      for (uint8_t i = 0; i < buffer_mem_len; i++) {
+        ESP_LOGI("adc", "ring_buffer[%d].adc_val[%d] = %d", l_tail, i,
+                 ring_buffer[l_tail].adc_val[i]);
+      }
+      ESP_LOGI("=========", "==========");
+#endif
+      portENTER_CRITICAL(&avg_spinlock);
+      avg_adc.store((float)(((float)adc_sum / (buffer_mem_len))));
+      portEXIT_CRITICAL(&avg_spinlock);
     }
-    // vTaskDelay(UART_DELAY);
+    vTaskDelay(UART_DELAY);
   }
   vTaskDelete(NULL);
 }
@@ -192,10 +230,12 @@ void uart_task(void *params) {
       uart_write_bytes(uart_port_num, (const char *)"\n\r", strlen("\n\r"));
 
       if (!strcmp("avg\r", read_buff) || !strcmp("avg\n", read_buff)) {
-        if (xSemaphoreTake(avg_mutex, portMAX_DELAY)) {
-          ESP_LOGI(uart_task_TAG.data(), "Average is %f", avg_adc.load());
-          xSemaphoreGive(avg_mutex);
-        }
+
+        portENTER_CRITICAL(&avg_spinlock);
+        float l_avg = avg_adc.load();
+        portEXIT_CRITICAL(&avg_spinlock);
+        ESP_LOGI(uart_task_TAG.data(), "Average is %f, Voltage at Pin = %u mV",
+                 l_avg, esp_adc_cal_raw_to_voltage(l_avg, &adc1_chars));
       }
     }
     vTaskDelay(2 * UART_DELAY);
@@ -208,13 +248,12 @@ extern "C" void app_main(void) {
   ESP_ERROR_CHECK(adc_init());
   ESP_ERROR_CHECK(uart_init());
 
-  signal_buff_full_bin = xSemaphoreCreateBinary();
-  signal_buff_empty_bin = xSemaphoreCreateBinary();
+  signal_buff_full = xSemaphoreCreateCounting(buffer_len, 0);
   avg_mutex = xSemaphoreCreateMutex();
 
   BaseType_t xReturn0 =
       xTaskCreate(&ADC_post_processing_Task, adc_processing_task_TAG.data(),
-                  TASK_STACK_SIZE, NULL, 1, &adc_processing_task_handle);
+                  TASK_STACK_SIZE, NULL, 2, &adc_processing_task_handle);
 
   if (xReturn0 != pdPASS) {
     ESP_LOGE(app_main_task_TAG.data(), "Failed to create task: %s",
