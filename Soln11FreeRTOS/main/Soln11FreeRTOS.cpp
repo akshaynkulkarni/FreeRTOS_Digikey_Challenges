@@ -3,8 +3,8 @@
  *
  * Demonstrate priority inversion.
  *
- * Date: February 12, 2021
- * Author: Shawn Hymel
+ * Date: Jun 15, 2023
+ * Author: Shawn Hymel, Akshay N Kulkarni
  * License: 0BSD
  */
 
@@ -29,14 +29,16 @@ static const BaseType_t app_cpu = 1;
 
 // Settings
 TickType_t cs_wait = 250;   // Time spent in critical section (ms)
-TickType_t med_wait = 5000; // Time medium task spends working (ms)
+TickType_t med_wait = 1750; // Time medium task spends working (ms)
 
 // Globals
-static SemaphoreHandle_t lock = NULL;
+// static SemaphoreHandle_t lock = NULL;
+
+static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 #define STACK_SIZE 12 * 1024
 
-//*****************************************************************************
+//*****************************************************************************//
 // Tasks
 
 // Task L (low priority)
@@ -52,23 +54,24 @@ void doTaskL(void *parameters) {
 
     // Take lock
     ESP_LOGI(doTaskL_task_TAG.data(), "Task L trying to take lock...");
+    TickType_t timestamp1 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    // xSemaphoreTake(lock, portMAX_DELAY);
+
+    // Enter CS
+    portENTER_CRITICAL(&spinlock);
     timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    xSemaphoreTake(lock, portMAX_DELAY);
-
-    // Say how long we spend waiting for a lock
-    ESP_LOGI(
-        doTaskL_task_TAG.data(),
-        "Task L got lock. Spent %d ms waiting for lock. Doing some work...",
-        (xTaskGetTickCount() * portTICK_PERIOD_MS) - timestamp);
-
+    timestamp1 = timestamp - timestamp1;
     // Hog the processor for a while doing nothing
-    timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
     while ((xTaskGetTickCount() * portTICK_PERIOD_MS) - timestamp < cs_wait)
       ;
-
+    portEXIT_CRITICAL(&spinlock);
+    // Say how long we spend waiting for a lock
+    ESP_LOGI(doTaskL_task_TAG.data(),
+             "Task L got lock. Spent %d ms waiting for lock. Did some work and "
+             "released lock...",
+             timestamp1);
     // Release lock
-    ESP_LOGI(doTaskL_task_TAG.data(), "Task L releasing lock.");
-    xSemaphoreGive(lock);
+    // xSemaphoreGive(lock);
 
     // Go to sleep
     vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -108,30 +111,33 @@ void doTaskH(void *parameters) {
 
     // Take lock
     ESP_LOGI(doTaskH_task_TAG.data(), "Task H trying to take lock...");
+    TickType_t timestamp1 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    // xSemaphoreTake(lock, portMAX_DELAY);
+
+    portENTER_CRITICAL(&spinlock);
     timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    xSemaphoreTake(lock, portMAX_DELAY);
-
-    // Say how long we spend waiting for a lock
-    ESP_LOGI(
-        doTaskH_task_TAG.data(),
-        "Task H got lock. Spent %d ms waiting for lock. Doing some work...",
-        (xTaskGetTickCount() * portTICK_PERIOD_MS) - timestamp);
-
+    timestamp1 = timestamp - timestamp1;
     // Hog the processor for a while doing nothing
-    timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
     while ((xTaskGetTickCount() * portTICK_PERIOD_MS) - timestamp < cs_wait)
       ;
+    portEXIT_CRITICAL(&spinlock);
 
+    // Say how long we spend waiting for a lock
+
+    ESP_LOGI(doTaskH_task_TAG.data(),
+             "Task H got lock. Spent %d ms waiting for lock. Did some work and "
+             "released lock...",
+             timestamp1);
     // Release lock
-    ESP_LOGI(doTaskH_task_TAG.data(), "Task H releasing lock.");
-    xSemaphoreGive(lock);
+    // ESP_LOGI(doTaskH_task_TAG.data(), "Task H releasing lock.");
+    // xSemaphoreGive(lock);
 
     // Go to sleep
     vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 }
 
-//*****************************************************************************
+//*****************************************************************************//
 // Main (runs as its own task with priority 1 on core 1)
 
 constexpr std::string_view app_main_task_TAG = "app_main_task";
@@ -140,9 +146,9 @@ extern "C" void app_main(void) {
 
   ESP_LOGI(app_main_task_TAG.data(), "---FreeRTOS Priority Inversion Demo---");
 
-  // Create semaphores and mutexes before starting tasks
-  lock = xSemaphoreCreateBinary();
-  xSemaphoreGive(lock); // Make sure binary semaphore starts at 1
+  //  Create semaphores and mutexes before starting tasks
+  // lock = xSemaphoreCreateBinary();
+  // xSemaphoreGive(lock); // Make sure binary semaphore starts at 1
 
   // The order of starting the tasks matters to force priority inversion
 
@@ -151,7 +157,7 @@ extern "C" void app_main(void) {
                           app_cpu);
 
   // Introduce a delay to force priority inversion
-  vTaskDelay(1 / portTICK_PERIOD_MS);
+  vTaskDelay(250 / portTICK_PERIOD_MS);
 
   // Start Task H (high priority)
   xTaskCreatePinnedToCore(doTaskH, "Task H", STACK_SIZE, NULL, 3, NULL,
